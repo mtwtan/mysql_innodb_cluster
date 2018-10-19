@@ -1,0 +1,220 @@
+---
+- name: "Build dynamic /etc/hosts file"
+  blockinfile:
+    dest: /etc/hosts
+    marker: "# {mark} ANSIBLE GENERATED HOSTS"
+    block: |
+      {% for host in groups['mysql'] %}
+      {{ hostvars[host].ansible_default_ipv4.address }} {{ hostvars[host].ansible_hostname }}.{{ domain_name }} {{ hostvars[host].ansible_hostname }}
+      {% endfor %}
+
+- name: "Set hostname to FQDN: {{ inventory_hostname }}.{{ domain_name }}"
+  hostname:
+    name: "{{ ansible_hostname }}.{{ domain_name }}"
+
+- name: "Enable MySQL Repository"
+  yum_repository:
+    name: mysql-community
+    description: "MySQL Community Repository"
+    baseurl: "{{ repo.mysql_community }}"
+    enabled: yes
+    gpgcheck: no
+
+- name: "Enable MySQL tools Repository"
+  yum_repository:
+    name: mysql-tools
+    description: "MySQL Tools Repository"
+    baseurl: "{{ repo.mysql_tools }}"
+    enabled: yes
+    gpgcheck: no
+
+- name: "Enable MySQL connectors Repository"
+  yum_repository:
+    name: mysql-connectors
+    description: "MySQL Tools Repository"
+    baseurl: "{{ repo.mysql_connectors }}"
+    enabled: yes
+    gpgcheck: no
+
+- name: "Install bind-utils"
+  yum:
+    name: bind-utils
+    state: present
+
+- name: "Install telnet"
+  yum:
+    name: telnet
+    state: present
+    
+- name: "Install VIM"
+  yum:
+    name: vim
+    state: present
+
+- name: "Install MySQL Packages"
+  yum:
+    name: "{{ mysql_packages }}"
+    state: present
+  register: package_installation
+
+- name: "Install MySQL Ansible Packages"
+  yum:
+    name: "{{ mysql_ansible_packages }}"
+    state: present
+
+- name: "Change mysql data directory to mysql data volume"
+  lineinfile:
+    path: /etc/my.cnf
+    regexp: '^datadir='
+    line: "datadir={{ mysql_data_dir }}"
+
+- name: "Ensure MySQL data directory exists"
+  file:
+    path: "{{ mysql_data_dir }}"
+    state: directory
+    owner: mysql
+    group: mysql
+
+- name: "Set SELinux Context for Data dir for MySQL"
+  sefcontext:
+    target: "{{ mysql_data_dir}}(/.*)?"
+    setype: mysqld_db_t
+    state: present
+
+- name: "Perform restorcon of mysql data director"
+  command: restorecon -R "{{ mysql_data_dir }}"
+
+- name: "Transfer Authentication File"
+  template:
+    src: client.my.cnf.j2
+    dest: "{{ ansible_user_dir }}/.my.cnf"
+    owner: "{{ ansible_user_id }}"
+    mode: 0600
+
+- name: "Enable the MySQL Daemon"
+  systemd:
+    name: mysqld
+    state: started
+    enabled: true
+
+- name: "Transfer baseline my.cnf configuration file"
+  template:
+    src: my.cnf.j2
+    dest: /etc/my.cnf
+    owner: root
+    mode: 0644
+  register: mysql_configuration
+
+- name: "Set MySQL root password"
+  script: "reset_password.sh '{{ mysql_root_password }}'"
+  when: package_installation|changed
+
+- name: "Stop MySQL"
+  systemd:
+    name: mysqld
+    state: stopped
+
+- name: "Configure firewalld for MySQL"
+  firewalld:
+    service: mysql
+    permanent: true
+    state: enabled
+    immediate: true
+
+- name: "Configure firewalld for MySQL Replication Group"
+  firewalld:
+    port: "{{ replication_port }}/tcp"
+    permanent: true
+    state: enabled
+    immediate: true
+
+- name: "Configure SELINUX to allow group replication on replication port"
+  seport:
+    ports: "{{ replication_port }}"
+    proto: tcp
+    setype: mysqld_port_t
+    state: present
+
+- name: "Comment out current file limits in mysqld.service"
+  lineinfile:
+    path: /usr/lib/systemd/system/mysqld.service
+    regexp: '^LimitNOFILE'
+    line: '#LimitNOFILE'
+
+- name: "Add new file and proc limits in mysqld.service"
+  shell: |
+    echo 'LimitNOFILE = 1024000' >> /usr/lib/systemd/system/mysqld.service
+    echo 'LimitNPROC = 1024000' >> /usr/lib/systemd/system/mysqld.service
+
+- name: "Comment out mysql limits in limits.conf"
+  lineinfile:
+    path: /etc/security/limits.conf
+    regexp: '^mysql'
+    line: '#mysql'
+
+- name: "Add new file limits in limits.conf"
+  shell: |
+    echo 'mysql hard nofile 1024000' >> /etc/security/limits.conf
+    echo 'mysql soft nofile 1024000' >> /etc/security/limits.conf
+
+- name: "Reload daemon"
+  command: "systemctl daemon-reload"
+
+- name: "Restart MySQL Daemon"
+  systemd:
+    name: mysqld
+    state: restarted
+    daemon_reload: yes
+
+- name: "Create icroot user on nodes"
+  mysql_user:
+    name: "icroot"
+    password: "{{ mysql_icroot_password }}"
+    priv: "{{ mysql_icroot_priv }}"
+    host: "{{ replication_user.host }}"
+    state: present
+    sql_log_bin: no
+
+- name: "Create replication user on nodes"
+  mysql_user:
+    name: "{{ replication_user.name }}"
+    password: "{{ replication_user.password }}"
+    priv: "{{ replication_user.priv }}"
+    host: "{{ replication_user.host }}"
+    state: present
+    sql_log_bin: no
+
+- name: "Configure replication recovery master"
+  command: mysql -NBe "CHANGE MASTER to MASTER_USER='{{ replication_user.name }}', MASTER_PASSWORD='{{ replication_user.password }}' FOR CHANNEL 'group_replication_recovery';"
+
+- name: "Check if group replication plugin has been installed"
+  shell: mysql -NBe "SHOW PLUGINS;" | grep group_replication
+  ignore_errors: yes
+  register: replication_plugin_check
+
+- name: "Install group replication plugin on nodes"
+  command: mysql -NBe "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
+  when: replication_plugin_check|failed
+
+- name: "Check if replication groups has been initialized"
+  shell: mysql -NBe "SELECT * FROM performance_schema.replication_group_members;" | awk '{print $NF}'
+  delegate_to: "{{ stack_name }}-0"
+  register: replication_init_master
+
+- name: "Initilize the replication group"
+  shell: |
+    mysql -NBe "SET GLOBAL group_replication_bootstrap_group=ON;"
+    mysql -NBe "START GROUP_REPLICATION;"
+    mysql -NBe "SET GLOBAL group_replication_bootstrap_group=OFF;"
+  delegate_to: "{{ stack_name }}-0"
+  when: replication_init_master.stdout == "OFFLINE"
+
+- name: "Check if slave is a part of a replication group"
+  shell: mysql -NBe "SELECT * FROM performance_schema.replication_group_members;" | awk '{print $NF}'
+  register: replication_init_slave
+
+- name: "Have slaves join replication group"
+  shell: |
+    mysql -NBe "START GROUP_REPLICATION;"
+  when: replication_init_slave.stdout == "OFFLINE"
+

@@ -1,0 +1,9 @@
+---
+node_count: 
+image: 
+flavor: 
+key_name: 
+mysql_network: 
+security_group: 
+data_volume_size: 
+ssh_user: ""
